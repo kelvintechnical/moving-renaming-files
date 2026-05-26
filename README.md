@@ -1,963 +1,603 @@
-# Lab 10: Moving and Renaming Files — `mv`
+# Lab: Moving and Renaming Files — `mv`
 
-**Series:** File Operations & Shell Fundamentals · **Lab 10 of the Novice → RHCA path**  
-**Certifications covered:** RHCSA EX200 (Tasks 8, 11, 16, 18, 20), RHCE EX294 (no native mv module — patterns matter), CKA (start/stop static pods via mv), RHCA building blocks (RH342, RH358)  
-**Prerequisite:** Labs 05–09  
-**Time Estimate:** 40–55 minutes  
-**Difficulty arc:** Tasks 1–6 foundation · 7–13 practical · 14–18 advanced · 19–20 exam-realistic
-
----
-
-## 🎯 Objective
-
-Master `mv` for both renaming (same directory) and relocating (different directory) files and directories. Understand the **two different things** `mv` does internally — instant rename on same filesystem vs `cp -a` + `rm` across filesystems — and the SELinux gotcha that breaks more services than any other single mistake.
+**Series:** linux-ops-mastery — RHCSA Essential Tools & File Operations
+**Subjects covered:** `mv` for rename within a directory, `mv` for relocation across directories, the difference between rename (atomic, inode unchanged) and cross-filesystem move (`copy + unlink`), `-i` interactive, `-n` no-clobber, `-f` force, `-u` update-only-if-newer, `-v` verbose, `-T` treat-as-file, multiple sources with `-t TARGET`, the trailing-slash gotcha, and how `mv` preserves SELinux context, owner, group, mode, and timestamps (without any extra flags)
+**Career arcs covered:** RHCSA (every "rename / move" exam task), RHCE (Ansible `copy:` + cleanup or `command: mv`), SRE (renaming log files for log rotation, swap-and-replace deploys), DevOps (build artifact relocation), AI/MLOps (atomic rename for safe checkpoint writes — `cp tmp; fsync; mv tmp final`)
+**Prerequisite:** Labs 05–09 (navigation, listing, copy, links)
+**Time Estimate:** 25 to 35 minutes
+**Difficulty arc:** Task 1 foundation (`mv` rename) · 2 move across directories · 3 atomic vs cross-FS · 4 safety flags · 5 multi-source with `-t` · 6 RHCSA exam-realistic capstone
 
 ---
 
-## 🧠 Concept: `mv` Does Two Different Things
+## Objective
 
-Internally, the kernel handles two cases:
+Move and rename files like you mean it — with the right safety flags, the right understanding of "atomic vs not," and the right reflex for the rename-temp-then-mv-final pattern that powers safe writes everywhere from `sed -i` to database WAL files.
 
-| Case | What actually happens | Speed | SELinux risk |
-|---|---|---|---|
-| **Same filesystem** | Rewrites the directory entry; inode unchanged | Instant, even for 100 GB files | **None** — context follows the inode |
-| **Different filesystem** | Effectively `cp -a SRC DST && rm SRC` | Slow (copies every byte) | **Yes** — new inode may inherit a different default context |
+The capstone is an exam-realistic prompt: *"In `/root/files/`, rename every file matching `*.txt` to have a `.txt.bak` suffix in one safe operation, and relocate the originals' renamed copies into `/root/files-archive/`. Verify that the originals are gone, the new names exist, and no data was lost."*
 
-> **The killer scenario:** moving `/home/user/site/` (same FS, context `user_home_t`) to `/var/www/html/`. Inode unchanged — but **SELinux context is still `user_home_t`**. Apache returns 403. Same-FS `mv` does **not** relabel.
+> **Lab safety note:** All experiments happen in `/tmp/mv-lab` and (briefly) `/root/files`. Nothing modifies system files.
+
+---
+
+## Concept: A "Move" Is Either a Rename or a Copy-Then-Delete
+
+`mv` does **two completely different things** depending on whether source and destination share a filesystem:
+
+- **Same filesystem:** `mv` calls `rename(2)`. The directory entry is rewritten in place; the inode is unchanged; the operation is **atomic** (either it happens or it does not — nothing in between). Free.
+- **Different filesystems:** `mv` copies the bytes to the new filesystem, then unlinks the old name. The new file has a new inode. The operation is **not atomic** — power-loss midway can leave a partial copy on the destination.
 
 ```
-Same FS mv:    rename entry → inode unchanged → context unchanged
-Cross-FS mv:   cp -a + rm   → new inode       → context = target dir default (unless -Z used)
+   ┌──────────────────────────────────────────────────────┐
+   │   mv /home/file /home/folder/file                    │
+   │                                                       │
+   │   Same FS → rename(2)  → atomic, inode unchanged     │
+   │   No data copy. Fast. Open file descriptors keep     │
+   │   working without interruption.                       │
+   ├──────────────────────────────────────────────────────┤
+   │   mv /home/file /mnt/usb/file                        │
+   │                                                       │
+   │   Different FS → copy + unlink                       │
+   │   New inode. Slow on large files. Open FDs to the    │
+   │   original keep working only on the source side.     │
+   └──────────────────────────────────────────────────────┘
 ```
+
+> **Why this matters:** Atomic rename is **the** safe-write primitive in Unix. Editors, databases, package managers, and log rotators all rely on it. Cross-filesystem `mv` does not get you that guarantee — and the failure mode (partial copy, original still present) can surprise you in scripts.
 
 ---
 
-## 📚 `mv` Reference
+## 📜 Why `mv` Exists — The Story
 
-| Flag | Long form | Purpose |
+In **Unix v1 (1971)**, every directory-entry change required two syscalls: link the file under the new name, then unlink the old. That's a non-atomic window where the file briefly has two names — fine on a single-user machine, dangerous on multi-user systems where another process might see both names at once.
+
+By **System V (1983)** the `rename(2)` syscall existed: one atomic operation that handles both the link and the unlink in the kernel. Crashes either complete the operation or not — there is no half-state visible to userspace.
+
+That syscall is the entire reason `mv` exists as a separate command from `ln + rm`. It is also why `mv` is the only Unix file operation that can guarantee atomicity when used carefully (same FS, no overwrite issues).
+
+> **The point of the story:** `mv` is not "move." `mv` is "atomic rename, with cross-filesystem copy as a fallback." Knowing which mode you are in tells you whether the operation is safe to interrupt.
+
+---
+
+## 👪 The mv Family — Who Lives There
+
+### `mv` flags
+
+| Flag | Meaning |
+|---|---|
+| (default) | Move (rename or copy+unlink) |
+| `-i` | Interactive — prompt before overwrite |
+| `-n` | No-clobber — skip if destination exists |
+| `-f` | Force — overwrite without prompt (default) |
+| `-u` | Update — overwrite only if source is newer |
+| `-v` | Verbose |
+| `-T` | Treat destination as a non-directory (avoid auto-renaming into directory) |
+| `-t TARGET` | Specify target dir; sources follow |
+
+### Related rename helpers
+
+| Tool | Notes |
+|---|---|
+| `rename 's/OLD/NEW/' FILES` | Perl rename — regex bulk rename (RHEL: `prename`) |
+| `for f in *.x; do mv "$f" "${f%.x}.y"; done` | Pure-bash bulk rename |
+| `install -m MODE src DST` | Copy with explicit mode (not strictly move) |
+| `cp -a SRC DST && rm -rf SRC` | Two-step "move" with metadata preserved |
+
+> **The point of the family tree:** `mv` is one command, but its two modes (rename vs copy+unlink) have very different semantics. The flags exist mostly to control overwrite behavior, not to change which mode is used.
+
+---
+
+## 🔬 The Anatomy of `mv` — In One Diagram
+
+```
+$ mv /home/user/a.txt /home/user/folder/
+
+Behavior:
+  1. stat /home/user/a.txt    — find inode + filesystem
+  2. stat /home/user/folder/  — find inode + filesystem
+  3. Are they on the same filesystem?
+       YES → rename(2)                    (atomic; inode unchanged)
+        NO → cp -a SRC DST then rm SRC    (slow; new inode)
+
+Trailing slash:
+  mv src.txt dst.txt          → rename file
+  mv src.txt dst              → if dst is a directory: places src AS dst/src
+                                if dst does not exist: renames src to dst
+  mv src.txt dst/             → trailing / forces "dst is a directory" expectation
+                                (errors if dst does not exist as a dir)
+
+Multiple sources:
+  mv a b c /target/           → /target/a, /target/b, /target/c
+  mv -t /target/ a b c        → same, but target specified first (script-friendly)
+```
+
+> **Reading rule:** Always test `mv` with `--no-target-directory` (`-T`) when you really mean "I want this exact name on the destination, not 'this name placed inside a directory of that name.'"
+
+---
+
+## 📚 mv Reference Table
+
+| Task | Command | Notes |
 |---|---|---|
-| `-i` | `--interactive` | Prompt before overwrite |
-| `-n` | `--no-clobber` | Never overwrite |
-| `-f` | `--force` | Overwrite without prompting (default; defeats `-i` alias) |
-| `-u` | `--update` | Move only if source is newer or destination missing |
-| `-v` | `--verbose` | Print each move |
-| `-b` | `--backup[=METHOD]` | Backup destination before overwriting |
-| `--backup=numbered` | — | Numbered backups |
-| `-T` | `--no-target-directory` | Treat destination as a regular file (prevents "moved into" surprise) |
-| `-t DIR` | `--target-directory=DIR` | Destination first — handy with xargs/find |
-| `-Z` | — | Set destination context to target dir's default |
-| `--strip-trailing-slashes` | — | Remove trailing `/` from sources |
+| Rename in place | `mv old new` | If `new` does not exist |
+| Move into a directory | `mv src dir/` | `src` ends up as `dir/src` |
+| Move and rename in one step | `mv src dir/newname` | Atomic on same FS |
+| Multiple sources | `mv a b c /target/` | Target must be a directory |
+| Multiple sources (target-first form) | `mv -t /target/ a b c` | Useful with `xargs` / loops |
+| Interactive | `mv -i a b` | Y/N on overwrite |
+| No-clobber | `mv -n a b` | Skip if dst exists |
+| Update-only | `mv -u a b` | Move only if src newer than dst |
+| Force | `mv -f a b` | Default; rarely needed |
+| Treat dst as file even if dir exists | `mv -T a b` | Avoid auto-into-directory placement |
+| Verbose | `mv -v a b` | Print operations |
+| Atomic-write safe pattern | `cmd > FILE.tmp && mv FILE.tmp FILE` | Avoid partial-write corruption |
+| Bulk rename `.txt` → `.bak` | `for f in *.txt; do mv "$f" "${f%.txt}.bak"; done` | Bash parameter expansion |
+
+> **Rule one of mv:** Same-FS `mv` is atomic and cheap. Cross-FS `mv` is `cp -a; rm -rf` under the hood — slow and not atomic. Always verify which mode you're in before relying on atomicity guarantees.
 
 ---
 
-## 🛣️ RHCA Pathway Sidebar
+## 🎯 Career Pathway Sidebar
 
-| Cert level | Why this lab matters |
+| Level | Why this lab matters |
 |---|---|
-| **RHCSA EX200** | Tasks 8, 11, 16, 18, 20 use `mv` plus restorecon |
-| **RHCE EX294** | No native `mv` module — patterns are `copy + file: state=absent` or `command: mv` |
-| **CKA** | Move static-pod manifests in/out of `/etc/kubernetes/manifests` to start/stop components |
-| **RHCA — RH342** | Quarantine pattern: `mv suspect.bin /tmp/quarantine/` |
-| **RHCA — RH358** | Service-config rollovers: `mv config.new config.old` |
+| **RHCSA candidate** | "Rename `/etc/foo.conf` to `/etc/foo.conf.bak` and create a new `/etc/foo.conf`" is a canonical question. |
+| **RHCE candidate** | Ansible `command: mv ...` or `copy: + file: state=absent` — both follow `mv` semantics. |
+| **SRE / Platform** | Atomic-write-then-rename is **the** standard for safe config rewrites: `cmd > /etc/conf.new && mv /etc/conf.new /etc/conf`. |
+| **DevOps** | Build outputs typically use `mv` to publish artifacts only when checksums pass. |
+| **AI / MLOps** | Checkpoint writes follow `torch.save(state, "ckpt.tmp"); os.replace("ckpt.tmp", "ckpt.pt")` — the Python equivalent of atomic `mv`. |
 
 ---
 
-## 🔧 The 20 Tasks
+## 🔧 The 6 Tasks
+
+> Six exam-realistic phases that build the **rename → move → verify → preserve metadata** habit.
 
 ---
 
-### Task 1 — Set up source files
+### Task 1 — Rename in place
 
-**Purpose:** Build a workspace with varied content.
+**Purpose:** Set up the sandbox and use `mv` to rename a file within the same directory; observe that the inode does not change.
 
 ```bash
-mkdir -p ~/mv-lab/{src,dst,archive}
-cd ~/mv-lab
-echo "alpha"   > src/alpha.txt
-echo "beta"    > src/beta.txt
-echo "gamma"   > src/gamma.log
-mkdir src/sub
-echo "deep"    > src/sub/deep.txt
-ls -lR
+mkdir -p /tmp/mv-lab && cd /tmp/mv-lab
+
+echo "rename test" > old-name.txt
+ls -li old-name.txt
+
+mv old-name.txt new-name.txt
+ls -li new-name.txt
 ```
 
-**Expected output (excerpt):**
+**Human-Readable Breakdown:** Build the sandbox, create `old-name.txt`, capture its inode, rename to `new-name.txt`, capture the inode again. Same inode — bytes never moved.
 
-```
-src:
-total 12
--rw-r--r--. 1 ec2-user ec2-user 6 Sep 12 14:00 alpha.txt
--rw-r--r--. 1 ec2-user ec2-user 5 Sep 12 14:00 beta.txt
--rw-r--r--. 1 ec2-user ec2-user 6 Sep 12 14:00 gamma.log
-drwxr-xr-x. 2 ec2-user ec2-user 22 Sep 12 14:00 sub
-```
+**Reading it left to right:** `mv old new` calls `rename(2)`. The kernel rewrites the directory entry from "old → inode N" to "new → inode N." Atomic, fast, zero data movement.
 
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `mkdir -p` | Create with parents |
-| `{src,dst,archive}` | Brace expansion → three dirs in one command |
-| `ls -lR` | Long, recursive listing |
-
-**Output decoded**
-
-| Entry | Meaning |
-|---|---|
-| Three `.txt`/`.log` files | Regular files |
-| `sub` | Subdirectory |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `mkdir: cannot create` | Path inside your home |
-
----
-
-### Task 2 — Rename a file in place
-
-**Purpose:** Most basic case — both arguments in the same directory.
-
-```bash
-cd ~/mv-lab/src
-ls -li alpha.txt
-mv alpha.txt alpha-renamed.txt
-ls -li alpha-renamed.txt
-```
+**The story:** Watch the inode column once and you stop worrying about "is mv expensive on a 100 GB file?" If it's the same filesystem, mv is microseconds regardless of size.
 
 **Expected output:**
 
-```
-1048601 -rw-r--r--. 1 ec2-user ec2-user 6 Sep 12 14:00 alpha.txt
-1048601 -rw-r--r--. 1 ec2-user ec2-user 6 Sep 12 14:00 alpha-renamed.txt
+```text
+12345 -rw-r--r--. 1 ec2-user ec2-user 12 May 26 14:10 old-name.txt
+12345 -rw-r--r--. 1 ec2-user ec2-user 12 May 26 14:10 new-name.txt
 ```
 
 **Switches**
 
 | Token | Meaning |
 |---|---|
-| `mv OLD NEW` | If both are in the same directory, this is a **rename** |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| Inode `1048601` matches | Confirms **inode unchanged** — no data copied |
-
-> Linux has no separate `rename` in coreutils — `mv` IS rename. (Perl ships a `rename`; util-linux ships a different one.) For exams, stick with `mv`.
+| `mv old new` | Rename (or move into dir) |
+| `ls -li FILE` | Long listing with inode number |
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| `mv: cannot stat 'alpha.txt'` | Already renamed — re-run from Task 1 setup |
+| `mv: cannot stat 'old-name.txt'` | File does not exist — `ls` to confirm |
+| Inode changed | You crossed filesystems — `mv` did copy+unlink |
+| `mv: 'new-name.txt' and 'old-name.txt' are the same file` | Tried to rename to itself |
 
 ---
 
-### Task 3 — Move a file into a directory
+### Task 2 — Move across directories on the same filesystem
 
-**Purpose:** Move without renaming. Trailing `/` makes the directory intent explicit.
+**Purpose:** Use `mv` to relocate files between directories on the same filesystem. Observe atomicity and that the inode is still preserved.
 
 ```bash
-cd ~/mv-lab
-mv src/beta.txt dst/
-ls dst/ src/
+cd /tmp/mv-lab
+mkdir -p src dst
+
+echo "alpha" > src/a.txt
+echo "bravo" > src/b.txt
+
+ls -li src/a.txt
+mv src/a.txt dst/
+ls -li dst/a.txt
+mv src/b.txt dst/b-renamed.txt
+ls -li dst/b-renamed.txt
+
+ls -R
 ```
+
+**Human-Readable Breakdown:** Make `src/` and `dst/`, populate `src/`, move one file as-is into `dst/`, move another file with a rename. Confirm inodes stay constant.
+
+**Reading it left to right:** `mv src/a.txt dst/` is `rename("src/a.txt", "dst/a.txt")` — single syscall. `mv src/b.txt dst/b-renamed.txt` is the same syscall with a different second arg. Trailing slash on destination tells `mv` to keep the source filename.
+
+**The story:** This is what `mv` is for 95% of the time — relocate or rename within one filesystem. Always atomic. Always cheap.
 
 **Expected output:**
 
-```
-beta.txt
-alpha-renamed.txt  gamma.log  sub
+```text
+12346 -rw-r--r--. 1 user user 6 May 26 14:11 src/a.txt
+12346 -rw-r--r--. 1 user user 6 May 26 14:11 dst/a.txt
+12347 -rw-r--r--. 1 user user 6 May 26 14:11 dst/b-renamed.txt
+.:
+dst  src
+
+./dst:
+a.txt  b-renamed.txt
+
+./src:
 ```
 
 **Switches**
 
 | Token | Meaning |
 |---|---|
-| `mv FILE DIR/` | Trailing `/` = destination is a directory; file keeps its name |
-
-**Output decoded**
-
-| Path | Effect |
-|---|---|
-| `dst/beta.txt` | Now lives in `dst/` |
-| `src/` | No longer contains `beta.txt` |
+| `mv FILE DIR/` | Move into directory (keep filename) |
+| `mv FILE DIR/NEWNAME` | Move and rename in one step |
+| `ls -R` | Recursive listing |
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| Move silently created a file named `dst` | `dst/` didn't exist — `mkdir -p dst` first |
+| `mv: target 'dst/' is not a directory` | `dst/` does not exist — `mkdir -p` first |
+| File replaced silently | Default `mv` is `-f` — use `-i` or `-n` for safety |
+| Inode changed | You crossed filesystems — check `df -T`/`stat` |
 
 ---
 
-### Task 4 — Move AND rename in one step
+### Task 3 — Cross-filesystem move = copy + delete
 
-**Purpose:** Specify both destination directory and new filename.
+**Purpose:** Demonstrate that moving across filesystems is not atomic — bytes get copied, original is deleted, and the inode number changes.
 
 ```bash
-mv src/gamma.log dst/gamma-archived.log
+cd /tmp/mv-lab
+
+echo "data" > original.txt
+ls -li original.txt
+df -T /tmp /dev/shm 2>/dev/null | head -n 3
+
+# /dev/shm is tmpfs (separate FS from / on most systems)
+mv original.txt /dev/shm/original.txt 2>/dev/null
+ls -li /dev/shm/original.txt
+ls original.txt 2>&1 | head -n 1
+
+# Bring it back
+mv /dev/shm/original.txt /tmp/mv-lab/
+ls -li /tmp/mv-lab/original.txt
+```
+
+**Human-Readable Breakdown:** Create a file under `/tmp` (the regular root filesystem on most setups), confirm `/dev/shm` is a different filesystem (`tmpfs`), and move the file there. Notice the **new inode number** at the destination — the bytes really did travel.
+
+**Reading it left to right:** `df -T` shows the filesystem type per mount. `/tmp` is usually on `/`; `/dev/shm` is `tmpfs`. `mv` detects different filesystems, falls back to copy+unlink, and the destination inode is new.
+
+**The story:** Knowing when `mv` is atomic and when it isn't is the difference between safe and unsafe scripts. "Always use temp-and-rename for atomic writes" only works if the temp lives on the same filesystem as the final.
+
+**Expected output:**
+
+```text
+12348 -rw-r--r--. 1 user user 5 May 26 14:12 original.txt
+Filesystem     Type  1K-blocks  Used  Available  Use%  Mounted on
+/dev/nvme0n1p1 xfs   ...
+tmpfs          tmpfs ...                                /dev/shm
+98765 -rw-r--r--. 1 user user 5 May 26 14:12 /dev/shm/original.txt
+ls: cannot access 'original.txt': No such file or directory
+12349 -rw-r--r--. 1 user user 5 May 26 14:12 /tmp/mv-lab/original.txt
+```
+
+**Switches**
+
+| Token | Meaning |
+|---|---|
+| `df -T PATH` | Show filesystem type for path |
+| `/dev/shm` | A tmpfs filesystem usually distinct from `/` |
+
+**Troubleshoot**
+
+| Symptom | Fix |
+|---|---|
+| Inode did not change | `/dev/shm` is on the same FS — try another mount point |
+| `Permission denied` on `/dev/shm` | Owner restrictions; `sudo` or pick a different mount |
+| `mv` left source file behind | Indicates a partial-copy failure mid-write |
+
+---
+
+### Task 4 — Safety flags: `-i`, `-n`, `-u`, `-v`
+
+**Purpose:** Practice the four safety flags so destructive mistakes during interactive `mv` are caught.
+
+```bash
+cd /tmp/mv-lab
+rm -rf src dst
+mkdir src dst
+echo "src content" > src/a.txt
+echo "dst content" > dst/a.txt
+
+# Interactive
+mv -i src/a.txt dst/    # answer 'n' to keep existing dst
+cat dst/a.txt
+
+# No-clobber
+echo "new src" > src/a.txt
+mv -n src/a.txt dst/
+cat dst/a.txt           # unchanged
+ls src/                 # src/a.txt is STILL THERE (no-clobber refuses)
+
+# Update — only move if src newer
+touch -d "1 hour ago" src/a.txt
+mv -u src/a.txt dst/
+cat dst/a.txt           # unchanged
+touch src/a.txt
+mv -u src/a.txt dst/
+cat dst/a.txt           # changed
+
+# Verbose
+echo "moveme" > src/b.txt
+mv -v src/b.txt dst/
+```
+
+**Human-Readable Breakdown:** Walk through `-i` (asks), `-n` (refuses), `-u` (only-if-newer), `-v` (loud). Each flag has a different defensive purpose.
+
+**Reading it left to right:** `-i` produces a prompt. `-n` silently skips the move when destination exists. `-u` compares mtimes. `-v` prints `'src' -> 'dst'`.
+
+**The story:** Production scripts that loop `mv` over thousands of files need `-n` and `-v` — `-n` prevents disasters; `-v` produces an audit trail.
+
+**Expected output:**
+
+```text
+mv: overwrite 'dst/a.txt'? n
+dst content
+dst content
+a.txt
+dst content
+src content
+'src/b.txt' -> 'dst/b.txt'
+```
+
+**Switches**
+
+| Token | Meaning |
+|---|---|
+| `-i` | Prompt before overwrite |
+| `-n` | Refuse if destination exists |
+| `-u` | Move only if source mtime > dst mtime |
+| `-v` | Print operations |
+
+**Troubleshoot**
+
+| Symptom | Fix |
+|---|---|
+| `-i` did not prompt | Script context — stdin not a tty |
+| `-n` skipped silently | That is the point |
+| `-u` did the wrong thing | Compare mtimes manually with `stat -c '%y'` |
+
+---
+
+### Task 5 — Multiple sources and the `-t` target-first form
+
+**Purpose:** Move many files into one directory in one command; use `-t` so the target is named **before** the sources (essential when generating mv calls from `xargs`).
+
+```bash
+cd /tmp/mv-lab
+rm -rf src dst
+mkdir src dst
+touch src/{1..5}.log
+
+# Target-last form (default)
+mv src/1.log src/2.log src/3.log dst/
+ls dst/
+
+# Target-first form with -t
+mv -t dst/ src/4.log src/5.log
+ls dst/
+
+# Same with brace expansion (within bash)
+mkdir src2
+touch src2/{a,b,c,d}.log
+mv -v src2/*.log dst/
+ls dst/
+
+# Pipe-friendly with xargs
+mkdir src3
+touch src3/extra1.log src3/extra2.log
+ls src3/*.log | xargs mv -t dst/
 ls dst/
 ```
 
+**Human-Readable Breakdown:** Move a batch of files in three different styles: standard `mv A B C DIR/`, the `-t TARGET` form (target named first), and a generator (`ls | xargs mv -t DST`).
+
+**Reading it left to right:** `mv -t TARGET sources...` exists because some shells / pipelines find it easier to vary the source list than the target. With `xargs`, this lets you stream filenames into a single `mv` invocation efficiently.
+
+**The story:** Once you write your first batch-move shell loop, you appreciate `-t`. It makes `xargs` and `find -exec mv -t TARGET {} +` clean.
+
 **Expected output:**
 
-```
-beta.txt  gamma-archived.log
+```text
+1.log  2.log  3.log
+1.log  2.log  3.log  4.log  5.log
+'src2/a.log' -> 'dst/a.log'
+'src2/b.log' -> 'dst/b.log'
+'src2/c.log' -> 'dst/c.log'
+'src2/d.log' -> 'dst/d.log'
+1.log 2.log 3.log 4.log 5.log a.log b.log c.log d.log
+1.log 2.log 3.log 4.log 5.log a.log b.log c.log d.log extra1.log extra2.log
 ```
 
 **Switches**
 
 | Token | Meaning |
 |---|---|
-| `mv FILE DIR/NEWNAME` | Move and rename atomically |
-
-**Output decoded**
-
-| File | Meaning |
-|---|---|
-| `gamma-archived.log` | Same file as `src/gamma.log`, new name and location |
+| `mv -t TARGET ...` | Target-first form |
+| `xargs mv -t DST` | Pipe filenames into a single `mv` |
+| `touch {1..5}.log` | Brace expansion — create five files |
+| `find ... -exec mv -t DIR {} +` | Bulk `find` rename pattern |
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| Destination already exists | `mv` will overwrite without prompt unless `-i` or `-n` |
+| `mv: missing destination file operand` | Forgot the target or supplied none — add `-t DIR` |
+| `mv: target 'X' is not a directory` | The target is a regular file — pre-create the directory |
+| `xargs: mv: argument list too long` | Use `find ... -exec mv -t DIR {} +` instead of `xargs` for very long lists |
 
 ---
 
-### Task 5 — Move multiple files into a directory
+### Task 6 — Capstone: RHCSA-realistic bulk rename + relocation
 
-**Purpose:** When you give `mv` ≥ 2 sources, the **last argument must be a directory**.
+**Task statement:** *"In `/root/files/`, rename every `*.txt` file to have a `.txt.bak` suffix and relocate every `.bak` into `/root/files-archive/`. Verify no `.txt` files remain in `/root/files/`, that every `.bak` exists in `/root/files-archive/`, and that no data was lost."*
 
-```bash
-mv src/sub src/alpha-renamed.txt dst/
-ls dst/ src/ 2>/dev/null
-```
-
-**Expected output:**
-
-```
-alpha-renamed.txt  beta.txt  gamma-archived.log  sub
-(src/ is empty)
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `mv f1 f2 ... DIR/` | Move all sources into DIR |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| Whole `sub/` moved | `mv` handles directories natively (no `-r` needed, unlike `cp`) |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `mv: target ... is not a directory` | Last arg must be a directory when ≥ 2 sources |
-
----
-
-### Task 6 — Interactive overwrite with `-i`
-
-**Purpose:** Prevent accidental clobbering.
+**Purpose:** Execute a real exam-style bulk rename + relocation, with verification.
 
 ```bash
-echo "old beta"  > dst/beta.txt
-echo "new beta"  > src/beta.txt
-mv -i src/beta.txt dst/
+sudo -i
+rm -rf /root/files /root/files-archive
+mkdir -p /root/files /root/files-archive
+
+for i in 1 2 3 4 5; do
+  echo "content $i" > /root/files/report$i.txt
+done
+ls /root/files/
+
+# Bulk rename to .txt.bak using bash parameter expansion
+cd /root/files
+for f in *.txt; do
+  mv -v -- "$f" "${f}.bak"
+done
+
+# Relocate all .bak files to the archive directory
+mv -v -t /root/files-archive/ /root/files/*.bak
+
+ls /root/files/
+ls /root/files-archive/
+
+# Verify
+test ! -f /root/files/report1.txt && echo "VERIFY: original .txt gone"
+test    -f /root/files-archive/report1.txt.bak && echo "VERIFY: renamed file relocated"
+
+# Byte-level integrity
+for f in /root/files-archive/*.bak; do
+  echo "$f: $(wc -c < "$f") bytes"
+done
 ```
 
-**Expected interaction:**
+**Human-Readable Breakdown:** Become root, create five test files in `/root/files`. Rename each `*.txt` to `*.txt.bak` using a loop with bash parameter expansion (`${f}.bak`). Then move every `.bak` into `/root/files-archive/` with `mv -t`. Verify originals are gone, destinations exist, and byte counts are sane.
 
-```
-mv: overwrite 'dst/beta.txt'? y
-```
+**Layer stack you built:**
 
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-i` | Prompt before each overwrite |
-
-**Output decoded**
-
-| Prompt | Action |
-|---|---|
-| `overwrite 'dst/beta.txt'?` | Type `y` or `n` |
-
-**Why on RHCA RH342:** Quarantine and rollback steps — always `-i` when destinations might exist.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Unexpected prompt | `alias mv='mv -i'` is active — type `\mv` to bypass once |
-
----
-
-### Task 7 — Never overwrite with `-n`
-
-**Purpose:** Idempotent: only move if destination is missing.
-
-```bash
-echo "stay here" > dst/keepme.txt
-echo "noop" > src/keepme.txt
-mv -n src/keepme.txt dst/
-cat dst/keepme.txt
+```text
+/root/files/                  (started with 5 *.txt files; now empty)
+   │
+   │  for f in *.txt; do mv "$f" "${f}.bak"; done   ← in-place rename
+   │
+   ▼
+/root/files/*.txt.bak         (intermediate state — both rename steps used `mv`)
+   │
+   │  mv -t /root/files-archive/ /root/files/*.bak  ← relocate
+   │
+   ▼
+/root/files-archive/          (now contains 5 *.txt.bak files)
+   ├── report1.txt.bak
+   ├── report2.txt.bak
+   ├── report3.txt.bak
+   ├── report4.txt.bak
+   └── report5.txt.bak
 ```
 
-**Expected output:**
+**The story:** This is the **canonical 90-second exam answer** for bulk rename. Memorize the spine: `for f in *.EXT; do mv "$f" "${f%.EXT}.NEW"; done` for in-place renames, `mv -t DST SRC1 SRC2 ...` for relocation. Variants are infinite; the pattern is fixed.
 
+**Expected verification output:**
+
+```text
+report1.txt  report2.txt  report3.txt  report4.txt  report5.txt
+renamed 'report1.txt' -> 'report1.txt.bak'
+renamed 'report2.txt' -> 'report2.txt.bak'
+...
+renamed '/root/files/report1.txt.bak' -> '/root/files-archive/report1.txt.bak'
+...
+
+report1.txt.bak  report2.txt.bak  report3.txt.bak  report4.txt.bak  report5.txt.bak
+VERIFY: original .txt gone
+VERIFY: renamed file relocated
+/root/files-archive/report1.txt.bak: 10 bytes
+/root/files-archive/report2.txt.bak: 10 bytes
+/root/files-archive/report3.txt.bak: 10 bytes
+/root/files-archive/report4.txt.bak: 10 bytes
+/root/files-archive/report5.txt.bak: 10 bytes
 ```
-stay here
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-n` | No-clobber — skip if destination exists |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| `stay here` | `dst/keepme.txt` survived; `mv -n` did nothing |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Combined `-n -i` | `-n` wins — silent skip, no prompt |
-
----
-
-### Task 8 — Force overwrite with `-f`
-
-**Purpose:** Bypass alias-induced prompts. `-f` is the default behavior of unmangled `mv`.
-
-```bash
-echo "clobber me" > dst/keepme.txt
-echo "winner" > src/keepme.txt
-mv -f src/keepme.txt dst/
-cat dst/keepme.txt
-```
-
-**Expected output:**
-
-```
-winner
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-f` | Force overwrite without prompting |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| `winner` | Destination was replaced |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Permission denied | Need write on the parent directory |
-
----
-
-### Task 9 — Backup before overwrite with `-b`
-
-**Purpose:** Auto-keep the previous version when overwriting.
-
-```bash
-echo "v1" > dst/configme.txt
-echo "v2" > src/configme.txt
-mv -b src/configme.txt dst/
-ls dst/configme*
-cat dst/configme.txt
-cat dst/configme.txt~
-```
-
-**Expected output:**
-
-```
-dst/configme.txt  dst/configme.txt~
-v2
-v1
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-b` | Backup destination before overwriting |
-| `--backup=numbered` | Use `.~1~`, `.~2~` numbering |
-
-**Output decoded**
-
-| File | Meaning |
-|---|---|
-| `dst/configme.txt` | New content (`v2`) |
-| `dst/configme.txt~` | Previous content (`v1`) saved automatically |
-
-**Why a sysadmin needs this:** "Edit a config" tasks where you want a `.bak` left behind for rollback.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Backup not appearing | If destination didn't exist, no backup needed |
-
----
-
-### Task 10 — Numbered backups for repeated moves
-
-**Purpose:** Multiple iterations need distinguishable backups.
-
-```bash
-echo "v3" > src/configme.txt
-mv --backup=numbered src/configme.txt dst/configme.txt
-echo "v4" > src/configme.txt
-mv --backup=numbered src/configme.txt dst/configme.txt
-ls dst/configme*
-```
-
-**Expected output:**
-
-```
-dst/configme.txt  dst/configme.txt.~1~  dst/configme.txt.~2~  dst/configme.txt~
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `--backup=numbered` | Numbered (`.~1~`, `.~2~`, ...) |
-| `--backup=simple` | Always `~` suffix |
-| `--backup=existing` | Match existing style |
-| `--backup=none` | No backup (default) |
-
-**Output decoded**
-
-| File | Meaning |
-|---|---|
-| `configme.txt` | Current (latest `v4`) |
-| `.~1~`, `.~2~` | Numbered prior versions |
-| `configme.txt~` | The Task 9 backup that remained |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Backups pile up over time | Periodic cleanup with `find dst -name '*~*~' -mtime +30 -delete` |
-
----
-
-### Task 11 — Verbose with `-v`
-
-**Purpose:** Watch what `mv` does — essential for multi-file jobs.
-
-```bash
-mkdir -p ~/mv-lab/staging
-touch ~/mv-lab/staging/{a,b,c,d,e}.tmp
-mv -v ~/mv-lab/staging/*.tmp ~/mv-lab/archive/
-```
-
-**Expected output:**
-
-```
-renamed '/home/ec2-user/mv-lab/staging/a.tmp' -> '/home/ec2-user/mv-lab/archive/a.tmp'
-renamed '/home/ec2-user/mv-lab/staging/b.tmp' -> '/home/ec2-user/mv-lab/archive/b.tmp'
-renamed '/home/ec2-user/mv-lab/staging/c.tmp' -> '/home/ec2-user/mv-lab/archive/c.tmp'
-renamed '/home/ec2-user/mv-lab/staging/d.tmp' -> '/home/ec2-user/mv-lab/archive/d.tmp'
-renamed '/home/ec2-user/mv-lab/staging/e.tmp' -> '/home/ec2-user/mv-lab/archive/e.tmp'
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-v` | Verbose — `renamed 'src' -> 'dst'` per move |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| Each `renamed` line | One file's source → destination |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| No output | Source glob didn't match — verify with `ls` first |
-
----
-
-### Task 12 — Same-FS move keeps the inode
-
-**Purpose:** Prove that same-filesystem `mv` is metadata-only (no data movement).
-
-```bash
-echo "stay same" > ~/mv-lab/same-fs.txt
-INODE_BEFORE=$(stat -c '%i' ~/mv-lab/same-fs.txt)
-mv ~/mv-lab/same-fs.txt ~/mv-lab/archive/
-INODE_AFTER=$(stat -c '%i' ~/mv-lab/archive/same-fs.txt)
-echo "Before: $INODE_BEFORE"
-echo "After : $INODE_AFTER"
-```
-
-**Expected output:**
-
-```
-Before: 1048622
-After : 1048622
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `stat -c '%i'` | Print inode number |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| Identical inode | Same-FS `mv` is a directory-entry rewrite — instant, no data copy |
-
-**Why a sysadmin needs this:** Moving a 200 GB file across the same FS is **instant**. Try it across mounts and watch hours pass.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Inodes differ | You crossed a filesystem boundary — check with `df` |
-
----
-
-### Task 13 — Cross-FS move changes the inode
-
-**Purpose:** Demonstrate that across mounts, `mv` performs a copy + delete.
-
-```bash
-df ~/mv-lab /tmp | column -t
-echo "cross fs" > ~/mv-lab/cross.txt
-INODE_BEFORE=$(stat -c '%i' ~/mv-lab/cross.txt)
-mv ~/mv-lab/cross.txt /tmp/
-INODE_AFTER=$(stat -c '%i' /tmp/cross.txt)
-echo "Before: $INODE_BEFORE"
-echo "After : $INODE_AFTER"
-```
-
-**Expected output (if `/tmp` is tmpfs):**
-
-```
-Filesystem  1K-blocks  Used    Available  Use%  Mounted on
-/dev/root   8000000    3500000 4500000    44%   /home/ec2-user/mv-lab
-tmpfs       500000     400     499600     1%    /tmp
-Before: 1048623
-After : 9123201
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `df FILE` | Show which filesystem the file lives on |
-
-**Output decoded**
-
-| Field | Meaning |
-|---|---|
-| Different mount points | Different filesystems |
-| Different inodes | Data was copied; old inode released |
-
-**Why a sysadmin needs this on RHCA RH358:** Performance — never use `mv` to relocate huge files across mounts in production; use `rsync --remove-source-files` so you can resume on interruption.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Inodes match (no change) | Both paths are on the same FS — pick truly different mount |
-
----
-
-### Task 14 — The SELinux trap (same-FS) — context survives
-
-**Purpose:** Same-FS move does **not** relabel. This breaks more service tasks than any other single mistake.
-
-```bash
-mkdir -p ~/mv-lab/source_dir
-echo "served file" > ~/mv-lab/source_dir/index.html
-ls -lZ ~/mv-lab/source_dir/index.html
-
-sudo mkdir -p /webroot
-sudo mv ~/mv-lab/source_dir /webroot/site
-sudo ls -lZ /webroot/site/index.html
-```
-
-**Expected output:**
-
-```
-unconfined_u:object_r:user_home_t:s0 /home/ec2-user/mv-lab/source_dir/index.html
-unconfined_u:object_r:user_home_t:s0 /webroot/site/index.html
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `ls -lZ` | Show SELinux context |
-
-**Output decoded**
-
-| Observation | Meaning |
-|---|---|
-| Context **unchanged** after move | Same-FS `mv` keeps the inode; SELinux type rides along |
-| `user_home_t` under `/webroot` | Wrong for a web root — Apache would 403 |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Stuck with wrong type | Fix it in Task 15 |
-
----
-
-### Task 15 — Fix the SELinux trap with `restorecon`
-
-**Purpose:** Recompute contexts from policy.
-
-```bash
-sudo restorecon -Rv /webroot
-sudo ls -lZ /webroot/site/index.html
-matchpathcon /webroot/site/index.html
-```
-
-**Expected output:**
-
-```
-Relabeled /webroot/site/index.html from unconfined_u:object_r:user_home_t:s0 to system_u:object_r:default_t:s0
-unconfined_u:object_r:default_t:s0 /webroot/site/index.html
-/webroot/site/index.html	system_u:object_r:default_t:s0
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `restorecon -R` | Recursive |
-| `restorecon -v` | Verbose |
-| `matchpathcon` | Show policy-defined context |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| `Relabeled ... from ... to ...` | The fix happened |
-| Context now `default_t` | Matches `/webroot`'s policy expectation |
-
-> If you want `httpd_sys_content_t` under `/webroot`, define it first: `sudo semanage fcontext -a -t httpd_sys_content_t '/webroot(/.*)?'` then `restorecon -Rv /webroot`.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `restorecon` says no change | Source and target dir share type, or no policy for this path — define one with `semanage fcontext` |
-
----
-
-### Task 16 — Inline context with `mv -Z`
-
-**Purpose:** Set destination context to target dir's default — equivalent of inline `restorecon`.
-
-```bash
-echo "labeled at move" > ~/mv-lab/labeled.html
-sudo mv -Z ~/mv-lab/labeled.html /webroot/
-sudo ls -lZ /webroot/labeled.html
-```
-
-**Expected output:**
-
-```
-unconfined_u:object_r:default_t:s0 /webroot/labeled.html
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-Z` | Set context to target directory's default |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| `default_t` | Already correct — no separate `restorecon` needed |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `mv: unrecognized option -Z` | Old coreutils — use plain `mv` + `restorecon` |
-
----
-
-### Task 17 — Build commands with `-t DIR` for find/xargs
-
-**Purpose:** "Target first" mode lets you pipe many sources from `find` or `xargs`.
-
-```bash
-mkdir -p ~/mv-lab/bulk_src ~/mv-lab/bulk_dst
-touch ~/mv-lab/bulk_src/file_{01..10}.tmp
-find ~/mv-lab/bulk_src -name '*.tmp' -exec mv -t ~/mv-lab/bulk_dst/ {} +
-ls ~/mv-lab/bulk_dst/
-```
-
-**Expected output:**
-
-```
-file_01.tmp  file_02.tmp  file_03.tmp  file_04.tmp  file_05.tmp
-file_06.tmp  file_07.tmp  file_08.tmp  file_09.tmp  file_10.tmp
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `-t DIR` | Target directory **first**; source names follow |
-| `find -exec ... {} +` | Batch arguments together (efficient) |
-
-**Output decoded**
-
-| Files | Meaning |
-|---|---|
-| All 10 moved | `find` batched them; `mv -t DIR ... files...` handled them in groups |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `mv: missing destination file operand` | Without `-t`, last arg must be the destination |
-
----
-
-### Task 18 — Prevent "moved into" surprise with `-T`
-
-**Purpose:** Tell `mv` "the destination is a regular file, not a directory" so it never descends.
-
-```bash
-mkdir -p ~/mv-lab/example_dest
-echo "v1" > ~/mv-lab/source.txt
-mv ~/mv-lab/source.txt ~/mv-lab/example_dest
-ls ~/mv-lab/example_dest/
-
-echo "v2" > ~/mv-lab/source.txt
-mv -T ~/mv-lab/source.txt ~/mv-lab/example_dest 2>&1 || true
-```
-
-**Expected output:**
-
-```
-source.txt
-mv: cannot overwrite directory '/home/ec2-user/mv-lab/example_dest' with non-directory
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-T` | Treat destination strictly as a regular file path |
-
-**Output decoded**
-
-| Phase | What happened |
-|---|---|
-| Without `-T` | File moved INTO `example_dest/` |
-| With `-T` | `mv` refused (good — saves accidental nesting) |
-
-**Why a sysadmin needs this:** Scripts that should rename, not relocate.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `-T` not supported | Use absolute file path for destination instead of a directory |
-
----
-
-### Task 19 — RHCSA-style scenario: rename + relocate + restorecon
-
-**Task statement:** *"Rename `/etc/myapp.conf` to `/etc/myapp.conf.old`, then move `/tmp/myapp.conf` into `/etc/`. Verify SELinux contexts."*
-
-```bash
-sudo touch /etc/myapp.conf
-echo "new config" | sudo tee /tmp/myapp.conf > /dev/null
-
-sudo ls -lZ /etc/myapp.conf
-sudo mv -v /etc/myapp.conf /etc/myapp.conf.old
-sudo mv -v /tmp/myapp.conf /etc/myapp.conf
-
-sudo ls -lZ /etc/myapp.conf /etc/myapp.conf.old
-sudo restorecon -Rv /etc/myapp.conf /etc/myapp.conf.old
-sudo ls -lZ /etc/myapp.conf /etc/myapp.conf.old
-```
-
-**Expected output (excerpts):**
-
-```
-unconfined_u:object_r:etc_t:s0 /etc/myapp.conf
-renamed '/etc/myapp.conf' -> '/etc/myapp.conf.old'
-renamed '/tmp/myapp.conf' -> '/etc/myapp.conf'
-... shows context (likely user_tmp_t for the newly arrived file)
-Relabeled /etc/myapp.conf from unconfined_u:object_r:user_tmp_t:s0 to system_u:object_r:etc_t:s0
-... shows etc_t for both
-```
-
-**Step-by-step rationale**
-
-| Step | Why |
-|---|---|
-| First `mv` | Same-FS rename — instant |
-| Second `mv` | Cross-FS (tmpfs `/tmp` → root `/etc`) — copies data, new inode, brings `user_tmp_t` |
-| `restorecon -Rv` | Recompute contexts — fixes both files |
-| `ls -lZ` before/after | Auditable proof |
-
-**Output decoded**
-
-| Phase | Context for `/etc/myapp.conf` |
-|---|---|
-| After mv | `user_tmp_t` (wrong) |
-| After restorecon | `etc_t` (correct) |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Context unchanged after restorecon | `/etc/myapp.conf` may be a new path — verify with `matchpathcon` |
-
----
-
-### Task 20 — CKA-style scenario: toggle a static pod with mv
-
-**Task statement (CKA-style):** *"Stop `kube-scheduler` by moving its manifest aside, then restart it."*
-
-> ⚠️ Run only on a kubeadm cluster you control. On the lab VM, simulate it by creating a placeholder.
-
-```bash
-sudo mkdir -p /etc/kubernetes/manifests /tmp/manifest-backup
-echo "apiVersion: v1
-kind: Pod
-metadata:
-  name: kube-scheduler
-  namespace: kube-system" | sudo tee /etc/kubernetes/manifests/kube-scheduler.yaml > /dev/null
-
-ls -l /etc/kubernetes/manifests/
-
-sudo mv -v /etc/kubernetes/manifests/kube-scheduler.yaml /tmp/manifest-backup/
-ls -l /etc/kubernetes/manifests/
-ls -l /tmp/manifest-backup/
-
-sudo mv -v /tmp/manifest-backup/kube-scheduler.yaml /etc/kubernetes/manifests/
-ls -l /etc/kubernetes/manifests/
-```
-
-**Expected output (excerpts):**
-
-```
--rw-r--r--. 1 root root ... /etc/kubernetes/manifests/kube-scheduler.yaml
-renamed '/etc/kubernetes/manifests/kube-scheduler.yaml' -> '/tmp/manifest-backup/kube-scheduler.yaml'
-(empty manifests dir)
--rw-r--r--. 1 root root ... /tmp/manifest-backup/kube-scheduler.yaml
-renamed '/tmp/manifest-backup/kube-scheduler.yaml' -> '/etc/kubernetes/manifests/kube-scheduler.yaml'
--rw-r--r--. 1 root root ... /etc/kubernetes/manifests/kube-scheduler.yaml
-```
-
-**Step-by-step rationale**
-
-| Step | Why |
-|---|---|
-| First `mv` to `/tmp/manifest-backup/` | kubelet stops the static pod |
-| Second `mv` back into manifests | kubelet restarts the static pod |
-
-**Output decoded**
-
-| Phase | Cluster state |
-|---|---|
-| File in manifests | Pod running |
-| File missing | Pod terminated by kubelet |
-| File back | Pod running again |
 
 **Cleanup**
 
 ```bash
-cd ~
-rm -rf ~/mv-lab
-sudo rm -rf /webroot /etc/myapp.conf /etc/myapp.conf.old /tmp/manifest-backup
-sudo rm -f /tmp/cross.txt
-sudo rm -rf /etc/kubernetes/manifests/kube-scheduler.yaml   # only in lab env
+rm -rf /tmp/mv-lab /root/files /root/files-archive
+exit
 ```
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| Pod doesn't toggle | You're not on a kubelet-managed node — this is purely a demonstration |
+| Filenames with spaces broke | Always quote `"$f"` |
+| `*.bak` glob did not match | No `.bak` files in the dir — confirm rename step worked |
+| Wanted to use `rename` (Perl) | `rename 's/\.txt$/.txt.bak/' *.txt` is the one-liner equivalent |
+| `Permission denied` writing to `/root/files-archive` | Not root — `sudo -i` |
 
 ---
 
-## 🔍 `mv` Decision Guide
+## 🔍 mv Decision Guide
 
 ```
-Renaming in the same directory?         → mv old new
-Moving into a directory?                → mv file dir/
-Moving and renaming together?           → mv file dir/newname
-Multiple files into a directory?        → mv f1 f2 f3 dir/
-Don't overwrite anything?               → mv -n
-Prompt before overwrite?                → mv -i
-Backup overwritten destination?         → mv -b   (or --backup=numbered)
-Verbose tracking of multi-file moves?   → mv -v
-Need correct SELinux context at target? → mv -Z   or   restorecon -Rv afterwards
-Cross-FS move (slow, copies bytes)?     → mv works, but inode changes — verify
-Build commands with find/xargs?         → mv -t DIR ...
-Prevent "moved INTO" surprise?          → mv -T
+Need to move or rename a file?
+  │
+  ├── "Same name, different directory"
+  │       └── ✅ mv src dst/
+  │
+  ├── "Same directory, different name"
+  │       └── ✅ mv old new
+  │
+  ├── "Both at once"
+  │       └── ✅ mv src dst/newname
+  │
+  ├── "Many sources, one destination"
+  │       └── ✅ mv a b c /target/
+  │       └── ✅ mv -t /target/ a b c
+  │
+  ├── "Be paranoid about overwriting"
+  │       └── ✅ mv -i src dst       (prompt)
+  │       └── ✅ mv -n src dst       (skip if dst exists)
+  │       └── ✅ mv -u src dst       (only if newer)
+  │
+  ├── "Atomic safe-write of a config file"
+  │       └── ✅ cmd > /etc/conf.tmp && mv /etc/conf.tmp /etc/conf
+  │
+  ├── "Bulk regex rename"
+  │       └── ✅ rename 's/\.old$/.new/' *.old      (RHEL: prename)
+  │
+  └── "Cross-filesystem move of huge file"
+          └── ⚠️ Be aware: mv falls back to cp -a + rm; not atomic.
+                 Consider rsync -aP for resumability.
 ```
 
 ---
 
-## ✅ Lab Checklist (20 Tasks)
+## ✅ Lab Checklist (6 Tasks)
 
-- [ ] 01 Set up `~/mv-lab/{src,dst,archive}`
-- [ ] 02 Rename a file in place
-- [ ] 03 Move a file into a directory
-- [ ] 04 Move and rename in one step
-- [ ] 05 Move multiple files into a directory
-- [ ] 06 Interactive overwrite with `-i`
-- [ ] 07 Skip overwrite with `-n`
-- [ ] 08 Force overwrite with `-f`
-- [ ] 09 Backup with `-b`
-- [ ] 10 Numbered backups with `--backup=numbered`
-- [ ] 11 Verbose with `-v`
-- [ ] 12 Confirm same-FS move keeps the inode
-- [ ] 13 Confirm cross-FS move changes the inode
-- [ ] 14 Observe SELinux context surviving a same-FS move
-- [ ] 15 Fix with `restorecon -Rv`
-- [ ] 16 Apply target context inline with `mv -Z`
-- [ ] 17 Use `mv -t DIR` with `find -exec`
-- [ ] 18 Prevent "moved INTO" surprise with `-T`
-- [ ] 19 Exam: rename + relocate + restorecon
-- [ ] 20 CKA: toggle static-pod with `mv`
+- [ ] 01 Set up `/tmp/mv-lab` and rename a file in place; inode unchanged
+- [ ] 02 Move across directories on the same filesystem; inode unchanged
+- [ ] 03 Move to a different filesystem (`/dev/shm`); observe new inode
+- [ ] 04 Practice `-i`, `-n`, `-u`, `-v` safety flags
+- [ ] 05 Move multiple sources with `-t TARGET` and `xargs mv -t`
+- [ ] 06 Execute the RHCSA capstone — bulk rename `*.txt → *.txt.bak` and relocate to archive
 
 ---
 
@@ -965,36 +605,35 @@ Prevent "moved INTO" surprise?          → mv -T
 
 | Mistake | Symptom | Fix |
 |---|---|---|
-| Renaming into a directory by mistake | File "disappears" into a folder | Use `-T` or check with `ls -ld dest` first |
-| Plain `mv` into `/var/www/html` | Apache 403 (wrong SELinux type) | Add `restorecon -Rv` after the move |
-| Trusting `mv` to carry contexts across FS | Owners/perms preserved; context may not | Run `restorecon -Rv` or pre-create `semanage fcontext` |
-| Overwriting without a backup | No undo | `mv -b` or `--backup=numbered` |
-| Using `*` glob — misses dotfiles | `.htaccess`, `.git` left behind | `mv src/. dst/` for contents |
-| Moving in-use file across FS | Partial copy if interrupted | Prefer `rsync --remove-source-files` for big jobs |
-| Forgetting `-v` on multi-file moves | Hard to confirm | Always `-v` for batch |
-| Moving a symlink expecting target to follow | Symlink moves; target stays | Dereference first (`readlink -f`) or `cp -aL` + `rm` |
+| Trailing `/` on destination that does not exist | `mv: ... is not a directory` | Drop `/` or `mkdir -p` first |
+| Renamed onto an existing file by accident | Original silently overwritten | Use `-i` interactively or `-n` in scripts |
+| Cross-FS `mv` of huge file mid-power-loss | Partial copy lingers | Use `rsync -aP --remove-source-files` |
+| Forgot to quote filename with spaces | `mv: cannot stat 'a'` (when name was `a b`) | Always quote `"$f"` |
+| Used `mv` expecting atomic write across filesystems | Not atomic | Keep temp file on same FS, then `mv` |
+| `mv DIR1 DIR2/` while `DIR2/DIR1` existed | Got "directory not empty" | Pre-clean target, or use `rsync` |
+| Bulk rename via `mv *.txt prefix*` | Got "target 'prefix*' is not a directory" | Use a `for` loop with parameter expansion |
+| Used `mv` then needed to undo | No undo | Always `cp -a` to staging first if irreversible |
+| Forgot `mv` updates ctime | Audit trail tampering | Use `cp -a` + `rm` if you must preserve ctime |
+| `mv` of open file | Renames the directory entry; open FDs still work | This is by design (Unix semantics) |
 
 ---
 
-## 📌 Exam Strategy
+## 🎯 Career & Interview Strategy
 
-**RHCSA EX200**
-- Know which filesystem source and destination live on — `df SRC DST`.
-- After any `mv` into an SELinux-aware path (`/var/www`, `/var/lib/*`, `/srv`, `/etc/*`), run `restorecon -Rv`.
-- For "rename" tasks, the answer is `mv` — don't search for a `rename` command.
+**RHCSA candidate**
+- The two patterns to memorize: in-place rename loop `for f in *.X; do mv "$f" "${f%.X}.Y"; done` and bulk relocate `mv -t /target/ *.bak`.
 
-**RHCE EX294 (Ansible)**
-- No native `mv` module. Idiomatic patterns:
-  - `copy:` + `file: state=absent` (clearest, idempotent)
-  - `command: mv ...` with `creates:` / `removes:` for idempotence
+**RHCE candidate**
+- Ansible has no first-class `mv` module; use `command: mv ...` with `creates:` / `removes:` guards for idempotence, or `copy: + file: state=absent`.
 
-**CKA**
-- Toggle control-plane: `mv /etc/kubernetes/manifests/kube-scheduler.yaml /tmp/` then back.
-- `mv` is the simplest way to stop a static pod cleanly.
+**SRE / Platform interview**
+- "Walk me through safely rewriting `/etc/sshd_config`." → `cat > /etc/sshd_config.tmp; mv /etc/sshd_config.tmp /etc/sshd_config; sshd -t; systemctl reload sshd`. Atomic rename + config check + reload.
 
-**RHCA**
-- RH342: quarantine pattern: `sudo mv suspect.bin /tmp/quarantine-$(date +%s)/` then investigate.
-- RH358: rolling deploys — `mv config.new config.live && systemctl reload`.
+**DevOps**
+- Build pipelines write to `dist.tmp/`, run integrity checks, then `mv dist.tmp dist` — atomic publish.
+
+**AI / MLOps**
+- PyTorch's `torch.save(state, "ckpt.tmp"); os.replace("ckpt.tmp", "ckpt.pt")` is the Python equivalent of atomic `mv` — never leaves a partially-written checkpoint visible.
 
 ---
 
@@ -1002,17 +641,15 @@ Prevent "moved INTO" surprise?          → mv -T
 
 | Lab | Connection |
 |---|---|
-| Lab 05 — Navigation | Knowing source/destination paths cold |
-| Lab 06 — `ls -lZ` | Verification tool after every move |
-| Lab 08 — `cp` | Cross-FS `mv` IS `cp -a` + `rm` |
-| Lab 09 — Links | Moving a symlink ≠ moving its target |
-| Lab 11 — `rm` | Same-FS `mv` = rename + unlink; cross-FS `mv` ends with `rm` |
-| Task 16 — Apache document root | Move + restorecon |
-| Task 20 — Config edits | `mv original original.bak` before editing |
+| Lab 05 — Directory Navigation | The path-discipline foundation |
+| Lab 08 — Copying Files | `mv` is `cp + rm` when crossing filesystems |
+| Lab 09 — Hard and Soft Links | `mv` of a hard link keeps the link; `mv` of a symlink moves the link, not the target |
+| Lab 11 — Safe Deletion | The cleanup tool — `mv` and `rm` are companions |
+| Lab 12 — Creating Nested Directories | Often paired with `mv` to relocate trees |
 
 ---
 
 ## 👤 Author
 
-**Kelvin R. Tobias**  
+**Kelvin R. Tobias**
 [kelvinintech.com](https://kelvinintech.com) · [GitHub](https://github.com/kelvintechnical) · [LinkedIn](https://www.linkedin.com/in/kelvin-r-tobias-211949219)
